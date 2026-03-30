@@ -103,7 +103,8 @@
 
 <script setup>
   import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-
+  /** 是否处于首次加载的强制等待期 */
+  let isInitialWaiting = true
   const props = defineProps({
     /** 列配置 */
     columns: {
@@ -485,7 +486,7 @@
   /** 重置所有运行时状态 */
   function resetRuntime() {
     lastTimestamp = 0
-    pauseUntil = 0
+    // pauseUntil = 0 // 注释掉这一行，或者在 startAnimation 里在 resetRuntime 之后赋值
     manualTargetOffset = null
     wheelActiveUntil = 0
     snapTargetOffset = null
@@ -617,25 +618,53 @@
   }
 
   /** step 模式自动滚动 */
+  /** step 模式自动滚动 */
   function runStep(timestamp, deltaMs) {
+    if (pauseUntil && timestamp < pauseUntil) return
+
+    // 1. 如果是初次加载，强制初始化 pauseUntil
+    if (isInitialWaiting) {
+      pauseUntil = timestamp + Math.max(0, props.pauseDuration)
+      isInitialWaiting = false // 只执行一次
+      return
+    }
+
+    // 2. 原有的停顿检查
     if (pauseUntil && timestamp < pauseUntil) return
 
     const rh = rowHeightNum.value
     const current = currentOffset.value
+
+    // 1. 计算当前行索引
     const currentRow = Math.floor(current / rh)
+    // 2. 明确目标位置：下一行的起始点
     const target = (currentRow + 1) * rh
+
+    // 3. 计算距离目标的剩余量
     const remain = target - current
 
-    // 已经足够接近下一行时，直接停到整行
+    // 关键修复：处理循环滚动边界
+    // 如果 remain 非常小或者因为精度问题变成了负数，说明已经到达切换点
     if (remain <= 0.5) {
+      // 强制归位到下一行起点，并进行取模（防止无限增长）
       currentOffset.value = normalizeOffset(target)
+      // 触发停顿
       pauseUntil = timestamp + Math.max(0, props.pauseDuration)
       return
     }
 
-    const distance = (Math.max(props.speed, 0) * deltaMs) / 1000
-    currentOffset.value = normalizeOffset(current + Math.min(distance, remain))
+    // 4. 计算本帧位移
+    const speed = Math.max(props.speed, 0)
+    const move = (speed * deltaMs) / 1000
 
+    // 5. 更新位移，但不允许超过本次 target
+    const nextOffset = current + Math.min(move, remain)
+
+    // 注意：这里先不 normalize，等停顿触发时再 normalize
+    // 否则在 listHeight 边界处，nextOffset 会突然变成 0，导致 remain 计算错误
+    currentOffset.value = nextOffset
+
+    // 6. 二次检查是否到达目标（针对大步长或高帧率）
     if (target - currentOffset.value <= 0.5) {
       currentOffset.value = normalizeOffset(target)
       pauseUntil = timestamp + Math.max(0, props.pauseDuration)
@@ -687,6 +716,10 @@
    * 启动动画
    * keepOffset = true 时尽量保留当前滚动位置
    */
+  /**
+   * 启动动画
+   * keepOffset = true 时尽量保留当前滚动位置
+   */
   async function startAnimation({ keepOffset = false } = {}) {
     const prev = currentOffset.value
 
@@ -695,12 +728,23 @@
 
     if (!keepOffset) {
       resetRuntime()
+      // 关键：重置初始等待标记
+      isInitialWaiting = true
+      // --- 关键修复：如果是 step 模式，首次加载给一个初始停顿时间 ---
+      if (normalizedMode.value === 'step') {
+        const now =
+          typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()
+        pauseUntil = now + Math.max(0, props.pauseDuration)
+        console.log(pauseUntil)
+      }
+      // -------------------------------------------------------
     } else {
       lastTimestamp = 0
       pauseUntil = 0
       manualTargetOffset = null
       wheelActiveUntil = 0
       snapTargetOffset = null
+      lastTimestamp = 0
       currentOffset.value = normalizeOffset(prev)
     }
 
@@ -893,8 +937,9 @@
   watch(
     () => props.data,
     () => {
-      startAnimation({ keepOffset: true })
-    }
+      startAnimation({ keepOffset: false }) // 数据变了，从第一行重新开始并等待
+    },
+    { deep: false }
   )
 
   onMounted(() => {
